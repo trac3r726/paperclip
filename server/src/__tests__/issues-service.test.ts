@@ -36,6 +36,7 @@ import {
   deriveIssueCommentRunLogAttribution,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
+  issueUpdatedAtETag,
 } from "../services/issues.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
@@ -4285,6 +4286,124 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       allBlockersDone: true,
       isDependencyReady: true,
     });
+  });
+
+  it("rejects moving a blocked issue to todo while unresolved blockers remain (SSC-2402)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, identifier: "PAP-2402-1", title: "Blocker", status: "todo", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked", status: "blocked", priority: "medium" },
+    ]);
+    await svc.update(blockedId, { blockedByIssueIds: [blockerId] });
+
+    await expect(
+      svc.update(blockedId, { status: "todo" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        unresolvedBlockerIssueIds: [blockerId],
+        unresolvedBlockers: [expect.objectContaining({ issueId: blockerId })],
+      },
+    });
+
+    // The rejected write must not have touched the row.
+    await expect(svc.getById(blockedId)).resolves.toMatchObject({ status: "blocked" });
+  });
+
+  it("allows moving a blocked issue to todo once its blockers are resolved (SSC-2402)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "done", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked", status: "blocked", priority: "medium" },
+    ]);
+    await svc.update(blockedId, { blockedByIssueIds: [blockerId] });
+
+    await expect(svc.update(blockedId, { status: "todo" })).resolves.toMatchObject({ status: "todo" });
+  });
+
+  it("allows a single request to both clear blockers and move a blocked issue to todo (SSC-2402)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "todo", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked", status: "blocked", priority: "medium" },
+    ]);
+    await svc.update(blockedId, { blockedByIssueIds: [blockerId] });
+
+    // The unresolved blocker is still `todo`, but this request removes the
+    // relation in the same PATCH, so the precondition evaluates against the
+    // post-sync (empty) blocker set, not the pre-sync one.
+    await expect(
+      svc.update(blockedId, { status: "todo", blockedByIssueIds: [] }),
+    ).resolves.toMatchObject({ status: "todo", blockedByIssueIds: [] });
+  });
+
+  it("rejects a PATCH whose If-Match no longer matches the issue's current version (SSC-2402)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Versioned", status: "todo", priority: "medium" });
+
+    await expect(
+      svc.update(issueId, { title: "Renamed", ifMatch: issueUpdatedAtETag(new Date(0)) }),
+    ).rejects.toMatchObject({ status: 412 });
+
+    // A mismatched If-Match must block the write even when it would
+    // otherwise be a no-op for every other field.
+    const current = await svc.getById(issueId);
+    await expect(
+      svc.update(issueId, { title: current!.title, ifMatch: issueUpdatedAtETag(new Date(0)) }),
+    ).rejects.toMatchObject({ status: 412 });
+  });
+
+  it("accepts a PATCH whose If-Match matches the issue's current version (SSC-2402)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Versioned", status: "todo", priority: "medium" });
+    const current = await svc.getById(issueId);
+
+    await expect(
+      svc.update(issueId, { title: "Renamed", ifMatch: issueUpdatedAtETag(current!.updatedAt) }),
+    ).resolves.toMatchObject({ title: "Renamed" });
   });
 
   it("unblocks a source issue when a liveness escalation recovery issue is marked done", async () => {

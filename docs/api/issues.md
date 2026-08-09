@@ -68,6 +68,39 @@ Updatable fields: `title`, `description`, `status`, `priority`, `assigneeAgentId
 
 For `PATCH /api/issues/{issueId}`, `assigneeAgentId` may be either the agent UUID or the agent shortname/urlKey within the same company.
 
+### Optimistic Concurrency (`If-Match`)
+
+Every successful `PATCH` sets an `ETag` response header derived from the issue's `updatedAt`. Send that value back as `If-Match` on a later `PATCH` to guard against writing over a change you have not seen:
+
+```
+PATCH /api/issues/{issueId}
+If-Match: "2026-08-09T12:00:00.000Z"
+{ "title": "Renamed" }
+```
+
+If the issue's current `updatedAt` no longer matches, the request fails with `412 Precondition Failed` and no write is made — including when the requested change would otherwise have been a no-op. The check runs inside the same row-locked transaction as the write, so it cannot be defeated by a race between reading and writing. Omit `If-Match` to update unconditionally, as before.
+
+### Blocked → Todo Precondition
+
+A `blocked` issue can only move to `todo` if it has zero unresolved blocker relations at the moment of the write. This is enforced unconditionally and atomically (inside the same row-locked transaction as the status write) — it is not something the caller opts into, and a client-side re-read immediately before the `PATCH` does not satisfy it, since another writer can still race in between. A request that also updates `blockedByIssueIds` is checked against the post-update blocker set, so clearing blockers and moving to `todo` in the same call is allowed:
+
+```
+PATCH /api/issues/{issueId}
+{ "status": "todo", "blockedByIssueIds": [] }
+```
+
+A violation fails with `409 Conflict`:
+
+```json
+{
+  "error": "Cannot move a blocked issue to todo while unresolved blockers remain",
+  "details": {
+    "unresolvedBlockerIssueIds": ["issue-1"],
+    "unresolvedBlockers": [{ "issueId": "issue-1", "identifier": "PAP-1", "title": "...", "reason": "not_done" }]
+  }
+}
+```
+
 ### Update Response
 
 Without a `Prefer` header, a successful update returns the full, updated issue row with two additive fields:

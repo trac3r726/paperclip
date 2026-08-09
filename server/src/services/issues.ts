@@ -65,7 +65,7 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, HttpError, notFound, preconditionFailed, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -1330,6 +1330,43 @@ async function listUnresolvedBlockerIssueIds(
       ),
     )
     .then((rows) => rows.map((row) => row.id));
+}
+
+// Live "blocks" relations for a single issue, read fresh (no caller-supplied
+// cache) so the blocked->todo precondition below always checks the state a
+// concurrent writer could have just changed, not a snapshot from earlier in
+// the request.
+async function listCurrentBlockerIssueIds(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  issueId: string,
+) {
+  return dbOrTx
+    .select({ id: issueRelations.issueId })
+    .from(issueRelations)
+    .where(
+      and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.relatedIssueId, issueId),
+      ),
+    )
+    .then((rows: Array<{ id: string }>) => rows.map((row) => row.id));
+}
+
+// `updatedAt` doubles as the issue's optimistic-concurrency version: it
+// changes on every committed write, so a client that read the issue can
+// pass it back via `If-Match` to detect a write that happened in between,
+// without a dedicated version column.
+export function issueUpdatedAtETag(updatedAt: Date): string {
+  return `"${updatedAt.toISOString()}"`;
+}
+
+function ifMatchHeaderSatisfied(ifMatchHeader: string, etag: string): boolean {
+  return ifMatchHeader
+    .split(",")
+    .map((value) => value.trim())
+    .some((value) => value === "*" || value === etag);
 }
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
@@ -7444,6 +7481,11 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        // Optimistic-concurrency precondition: the caller's last-seen `updatedAt`
+        // ETag (see `issueUpdatedAtETag`). Checked against the row-locked read
+        // inside the write transaction; mismatch throws a 412 and the write
+        // never happens.
+        ifMatch?: string | null;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -7462,6 +7504,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        ifMatch,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -7617,6 +7660,43 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+
+        if (ifMatch) {
+          const currentETag = issueUpdatedAtETag(receiptExisting.updatedAt);
+          if (!ifMatchHeaderSatisfied(ifMatch, currentETag)) {
+            throw preconditionFailed("If-Match precondition failed: issue was modified since it was read", {
+              expectedETag: currentETag,
+            });
+          }
+        }
+
+        // Atomic blocked->todo precondition (SSC-2402): the row lock above
+        // serializes this against any other update racing on the same issue,
+        // so this check — and the write it gates — see the same, current
+        // row. A client-side re-read immediately before the PATCH cannot
+        // close this race; only a check made under this lock can.
+        if (receiptExisting.status === "blocked" && patch.status === "todo") {
+          const effectiveBlockerIssueIds = blockedByIssueIds !== undefined
+            ? blockedByIssueIds
+            : await listCurrentBlockerIssueIds(tx, existing.companyId, id);
+          const unresolvedBlockerIssueIds = await listUnresolvedBlockerIssueIds(
+            tx,
+            existing.companyId,
+            effectiveBlockerIssueIds,
+          );
+          if (unresolvedBlockerIssueIds.length > 0) {
+            const unresolvedBlockers = await listUnresolvedBlockerDetails(
+              tx,
+              existing.companyId,
+              unresolvedBlockerIssueIds,
+            );
+            throw conflict("Cannot move a blocked issue to todo while unresolved blockers remain", {
+              unresolvedBlockerIssueIds,
+              unresolvedBlockers,
+            });
+          }
+        }
+
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])
