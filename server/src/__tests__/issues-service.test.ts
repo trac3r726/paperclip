@@ -36,8 +36,8 @@ import {
   deriveIssueCommentRunLogAttribution,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
-  issueUpdatedAtETag,
 } from "../services/issues.ts";
+import { issueUpdatedAtETag } from "../services/issue-etag.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
