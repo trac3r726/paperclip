@@ -68,6 +68,7 @@ import {
 import { conflict, HttpError, notFound, preconditionFailed, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
+import { ifMatchHeaderSatisfied, issueUpdatedAtETag } from "./issue-etag.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
@@ -1354,20 +1355,6 @@ async function listCurrentBlockerIssueIds(
     .then((rows: Array<{ id: string }>) => rows.map((row) => row.id));
 }
 
-// `updatedAt` doubles as the issue's optimistic-concurrency version: it
-// changes on every committed write, so a client that read the issue can
-// pass it back via `If-Match` to detect a write that happened in between,
-// without a dedicated version column.
-export function issueUpdatedAtETag(updatedAt: Date): string {
-  return `"${updatedAt.toISOString()}"`;
-}
-
-function ifMatchHeaderSatisfied(ifMatchHeader: string, etag: string): boolean {
-  return ifMatchHeader
-    .split(",")
-    .map((value) => value.trim())
-    .some((value) => value === "*" || value === etag);
-}
 async function getProjectDefaultGoalId(
   db: ProjectGoalReader,
   companyId: string,
