@@ -9892,7 +9892,9 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(issue, actor.runId);
-    res.setHeader("ETag", issueUpdatedAtETag(issue.updatedAt));
+    if (issue.updatedAt) {
+      res.setHeader("ETag", issueUpdatedAtETag(issue.updatedAt));
+    }
     const changes = issueResponse.changes ?? {};
     if (prefersMinimalIssueUpdateResponse(req)) {
       res.setHeader("Preference-Applied", "return=minimal");
