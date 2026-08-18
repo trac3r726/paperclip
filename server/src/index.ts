@@ -128,10 +128,31 @@ export interface StartedServer {
   databaseUrl: string;
 }
 
+type StartupPhase =
+  | "instrumentation"
+  | "migrations"
+  | "database"
+  | "backfills"
+  | "auth"
+  | "create-app"
+  | "plugin-load"
+  | "startup-reconciliation"
+  | "listen";
+
+function logStartupPhase(phase: StartupPhase, startedAt: number): void {
+  logger.info(
+    { phase, durationMs: Math.round(performance.now() - startedAt) },
+    "startup phase complete",
+  );
+}
+
 export async function startServer(): Promise<StartedServer> {
+  const startupStartedAt = performance.now();
+  const instrumentationStartedAt = performance.now();
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
+  logStartupPhase("instrumentation", instrumentationStartedAt);
   ensureDecisionSigningSecret();
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
@@ -341,10 +362,13 @@ export async function startServer(): Promise<StartedServer> {
   let startupDbInfo:
     | { mode: "external-postgres"; connectionString: string }
     | { mode: "embedded-postgres"; dataDir: string; port: number };
+  const databaseStartedAt = performance.now();
   assertCloudDatabaseContract();
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
+    const migrationsStartedAt = performance.now();
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
+    logStartupPhase("migrations", migrationsStartedAt);
   
     db = createDb(config.databaseUrl);
     pluginMigrationDb = config.databaseMigrationUrl ? createDb(config.databaseMigrationUrl) : db;
@@ -511,9 +535,11 @@ export async function startServer(): Promise<StartedServer> {
     if (shouldAutoApplyFirstRunMigrations) {
       logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");
     }
+    const migrationsStartedAt = performance.now();
     migrationSummary = await ensureMigrations(embeddedConnectionString, "Embedded PostgreSQL", {
       autoApply: shouldAutoApplyFirstRunMigrations,
     });
+    logStartupPhase("migrations", migrationsStartedAt);
   
     db = createDb(embeddedConnectionString);
     pluginMigrationDb = db;
@@ -522,6 +548,7 @@ export async function startServer(): Promise<StartedServer> {
     resolvedEmbeddedPostgresPort = port;
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
+  logStartupPhase("database", databaseStartedAt);
   
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
     throw new Error(
@@ -562,6 +589,8 @@ export async function startServer(): Promise<StartedServer> {
   let resolveSessionFromHeaders:
     | ((headers: Headers) => Promise<BetterAuthSessionResult | null>)
     | undefined;
+  const authStartedAt = performance.now();
+  const backfillsStartedAt = performance.now();
   if (config.deploymentMode === "local_trusted") {
     await ensureLocalTrustedBoardPrincipal(db as any);
   }
@@ -578,6 +607,7 @@ export async function startServer(): Promise<StartedServer> {
   if (confirmationSweep.expired > 0) {
     logger.info(confirmationSweep, "Expired pending confirmations superseded by newer agent requests");
   }
+  logStartupPhase("backfills", backfillsStartedAt);
   if (config.deploymentMode === "authenticated") {
     const {
       createBetterAuthHandler,
@@ -611,6 +641,7 @@ export async function startServer(): Promise<StartedServer> {
     await initializeBoardClaimChallenge(db as any, { deploymentMode: config.deploymentMode });
     authReady = true;
   }
+  logStartupPhase("auth", authStartedAt);
 
   if (resolvedEmbeddedPostgresPort !== null && resolvedEmbeddedPostgresPort !== config.embeddedPostgresPort) {
     config.embeddedPostgresPort = resolvedEmbeddedPostgresPort;
@@ -734,6 +765,7 @@ export async function startServer(): Promise<StartedServer> {
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
+  const createAppStartedAt = performance.now();
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -770,6 +802,14 @@ export async function startServer(): Promise<StartedServer> {
     decisionServiceOptions,
     managedPluginAutoInstall,
   });
+  logStartupPhase("create-app", createAppStartedAt);
+  const pluginLoadStartedAt = performance.now();
+  const bundledPluginsStartup = (app as { locals?: { bundledPluginsStartup?: Promise<unknown> } })
+    .locals?.bundledPluginsStartup;
+  void bundledPluginsStartup?.then(
+    () => logStartupPhase("plugin-load", pluginLoadStartedAt),
+    () => logStartupPhase("plugin-load", pluginLoadStartedAt),
+  );
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
   // Increase keep-alive timeouts to safely outlive default idle timeouts
@@ -810,6 +850,8 @@ export async function startServer(): Promise<StartedServer> {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
   });
+
+  const startupReconciliationStartedAt = performance.now();
 
   void reconcilePersistedRuntimeServicesOnStartup(db as any)
     .then((result) => {
@@ -897,8 +939,6 @@ export async function startServer(): Promise<StartedServer> {
   // additionally gates each entry on a live plugin worker (and archives the
   // row of a provider that did not come up).
   try {
-    const bundledPluginsStartup = (app as { locals?: { bundledPluginsStartup?: Promise<unknown> } })
-      .locals?.bundledPluginsStartup;
     const managedEnvironmentsResult = await applyManagedEnvironments(db as any, managedConfig, {
       pluginsReady: bundledPluginsStartup,
       workerManager: pluginWorkerManager,
@@ -1328,6 +1368,7 @@ export async function startServer(): Promise<StartedServer> {
       scheduleExternalObjectRefreshSweep(new Date());
     });
   }
+  logStartupPhase("startup-reconciliation", startupReconciliationStartedAt);
   
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
@@ -1365,6 +1406,7 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  const listenStartedAt = performance.now();
   await new Promise<void>((resolveListen, rejectListen) => {
     const onError = (err: Error) => {
       server.off("error", onError);
@@ -1375,6 +1417,11 @@ export async function startServer(): Promise<StartedServer> {
     server.listen(listenPort, config.host, () => {
       server.off("error", onError);
       logger.info(`Server listening on ${config.host}:${listenPort}`);
+      logStartupPhase("listen", listenStartedAt);
+      logger.info(
+        { durationMs: Math.round(performance.now() - startupStartedAt) },
+        "Paperclip startup complete",
+      );
       void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
         if (notified) logger.info("Notified systemd that Paperclip is ready");
       });
