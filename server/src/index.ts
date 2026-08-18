@@ -5,6 +5,7 @@
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { runHeartbeatSchedulerTick } from "./heartbeat-scheduler.js";
+import { installUnhandledRejectionBoundary } from "./process-error-boundary.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -34,6 +35,10 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+
+installUnhandledRejectionBoundary((err) => {
+  logger.error({ err }, "unhandled promise rejection contained at process boundary");
+});
 import {
   getManagedInstanceConfig,
   type ManagedInstanceConfig,
